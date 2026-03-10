@@ -14,12 +14,15 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <string.h>
 #include "hal.h"
 #include "annepro2.h"
 #include "annepro2_ble.h"
 #include "spi_master.h"
 #include "ap2_led.h"
 #include "protocol.h"
+#include "timer.h"
+#include "print.h"
 
 #define RAM_MAGIC_LOCATION 0x20001ffc
 #define IAP_MAGIC_VALUE 0x0000fab2
@@ -43,6 +46,9 @@ static const SerialConfig ble_uart_config = {
 static uint8_t led_mcu_wakeup[11] = {0x7b, 0x10, 0x43, 0x10, 0x03, 0x00, 0x00, 0x7d, 0x02, 0x01, 0x02};
 
 ble_capslock_t ble_capslock = {._dummy = {0}, .caps_lock = false};
+
+static uint8_t ble_rx_buf[sizeof(ble_capslock_t)];
+static uint8_t ble_rx_pos = 0;
 
 #ifdef RGB_MATRIX_ENABLE
 static uint8_t led_enabled = 1;
@@ -115,20 +121,63 @@ void keyboard_post_init_kb(void) {
 }
 
 void matrix_scan_kb(void) {
+    uint32_t scan_start = 0;
+#ifdef CONSOLE_ENABLE
+    scan_start = timer_read32();
+    static uint32_t last_scan_log   = 0;
+    static uint32_t scan_count      = 0;
+    static uint32_t max_scan_us     = 0;
+    static uint32_t ble_bytes_read  = 0;
+    static uint32_t ble_packets_rx  = 0;
+    static uint32_t led_bytes_read  = 0;
+#endif
+
     // if there's stuff on the ble serial buffer
-    // read it into the capslock struct
+    // read it into the capslock struct without blocking for a full packet
     while (!sdGetWouldBlock(&SD1)) {
-        sdReadTimeout(&SD1, (uint8_t *)&ble_capslock, sizeof(ble_capslock_t), 10);
+        ble_rx_buf[ble_rx_pos++] = (uint8_t)sdGet(&SD1);
+#ifdef CONSOLE_ENABLE
+        ble_bytes_read++;
+#endif
+
+        if (ble_rx_pos == sizeof(ble_capslock_t)) {
+            memcpy(&ble_capslock, ble_rx_buf, sizeof(ble_capslock_t));
+            ble_rx_pos = 0;
+#ifdef CONSOLE_ENABLE
+            ble_packets_rx++;
+#endif
+        }
     }
 
     /* While there's data from LED keyboard sent - read it. */
     while (!sdGetWouldBlock(&SD0)) {
         uint8_t byte = sdGet(&SD0);
+#ifdef CONSOLE_ENABLE
+        led_bytes_read++;
+#endif
         proto_consume(&proto, byte);
     }
 
-
     matrix_scan_user();
+
+#ifdef CONSOLE_ENABLE
+    uint32_t elapsed_us = timer_elapsed32(scan_start) * 1000;
+    scan_count++;
+    if (elapsed_us > max_scan_us) {
+        max_scan_us = elapsed_us;
+    }
+
+    if (timer_elapsed32(last_scan_log) >= 1000) {
+        dprintf("annepro2 scan max=%luus scans=%lu ble_bytes=%lu ble_packets=%lu led_bytes=%lu ble_partial=%u\n",
+                max_scan_us, scan_count, ble_bytes_read, ble_packets_rx, led_bytes_read, ble_rx_pos);
+        last_scan_log  = timer_read32();
+        scan_count     = 0;
+        max_scan_us    = 0;
+        ble_bytes_read = 0;
+        ble_packets_rx = 0;
+        led_bytes_read = 0;
+    }
+#endif
 }
 
 bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
